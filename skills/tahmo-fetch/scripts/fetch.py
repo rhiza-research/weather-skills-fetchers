@@ -17,7 +17,8 @@
 #
 #     tahmo-fetch --list-stations --bbox N/W/S/E
 #
-# Then fetch chosen station IDs (and/or every TA station in a bbox).
+# Then fetch chosen station IDs (or every TA station in a bbox): 5-minute records of
+# the ``-v`` variables, or complete-day values with ``--daily``.
 #
 # With ``--gridded``, reads Sheerwater's historical all-Africa 0.25° TAHMO precip grid
 # from private GCS instead (Google credentials, no TAHMO login). With ``--gold-stations``,

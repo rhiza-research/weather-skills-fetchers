@@ -34,7 +34,7 @@ uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --probe-latest --gridded
 ```
 
 ### Date range
-- Station mode: March 2015 to yesterday (`--probe-latest`). Station records vary and may have gaps; a fetch prints each station's complete days.
+- Station mode: March 2015 to yesterday (`--probe-latest`). Each station starts after March 2015 and has gaps.
 - `--gold-stations`, `--gridded`: 2015-03-05 to 2025-09-13, not updated.
 
 ### Arguments
@@ -42,34 +42,33 @@ uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --probe-latest --gridded
 - `--station` — station id such as `TA00025`; repeatable. Overrides `--bbox`. An unknown id exits 2.
 - `--bbox` — `N/W/S/E`. Without `--station`, selects every `TA` station in the box.
 - `--start-time`, `--end-time` — inclusive days, `YYYY-MM-DD`.
-- `--day-start-hour` — with `--daily`: UTC hour each day starts at (default 0). With 6, day D runs 06 UTC D to 06 UTC D+1, as KMSA uses.
 - `--variable`, `-v` — variable to fetch, repeatable: `precip`, `temperature`, `humidity`, `pressure`, or any TAHMO code (e.g. `ra` shortwave radiation, `lb` logger battery %, `lv` logger battery voltage; `pr`, `te`, `rh`, `ap` are the first four). `tmax` and `tmin` need `--daily`. An unknown name exits 2 and lists the ones TAHMO knows.
-- `--daily` — write complete-day values instead of 5-minute records (below). Only `precip`, `temperature`, `tmax`, `tmin`, `humidity` and `pressure` have them; any other `-v` exits 2. Without `-v`, all six. Station mode needs `-v` or `--daily`.
+- `--daily` — complete-day values instead of 5-minute records. Only `precip`, `temperature`, `tmax`, `tmin`, `humidity` and `pressure` have them; any other `-v` exits 2. Without `-v`, all six. Station mode needs `-v` or `--daily`.
+- `--day-start-hour` — with `--daily`: UTC hour each day starts at (default 0). With 6, day D runs 06 UTC D to 06 UTC D+1, as KMSA uses.
 - `--workers` — concurrent station downloads (default 8). Lower it if TAHMO throttles.
 - `--gold-stations` — read the gold station store (below). Takes `--station`, `--bbox` and the times; with neither, every station.
 - `--gridded` — read the gridded store (below). Takes only the times and `--bbox`.
 - `--probe-latest` — print the newest complete day in the last 14 days (default stations: the first three TA stations).
 - `--output`, `-o` — output Zarr, overwritten.
 
-### Output (`--daily`)
-- Dims `(time, station_id)`, coords `latitude`, `longitude`, `name`, `country`; `featureType="timeSeries"`.
-- `precip` (`mm day-1`, sum), `temperature`, `tmax`, `tmin` (`degree_Celsius`), `humidity` (`1`), `pressure` (`kPa`): whichever the stations report.
-- `time` is every requested day, labelled by its start date; `data_interval` `1 day`.
-- Each station starts after March 2015 and has gaps. Only records with TAHMO quality flag <= 2 are used.
-- Stamps mark the end of each 5-minute interval, so day D holds D H:05 to D+1 H:00.
-- A day is NaN unless all 288 records passed QC, for each variable separately (`tmax`/`tmin` follow `temperature`).
-- A station with several sensors of one variable gets, per 5-minute record and in both modes, the mean of the readings with the best QC flag. Among those, a rain gauge reading under 0.01 mm in 5 minutes while another reads more is taken as blocked and left out.
+### Station mode
+Both modes start from the same 5-minute records:
+- Only records with TAHMO quality flag <= 2 are used; others count as missing. Nothing is filled.
+- A station with several sensors of one standard variable gets, per record, the mean of the readings with the best quality flag. Among those, a rain gauge reading under 0.01 mm while another reads more is taken as blocked and left out. Several sensors of any other code (such as soil sensors at several depths) exit 1.
+- `precip` is a rate in `mm day-1` (each 5-minute amount × 288).
+- TAHMO stamps the end of each interval; the output labels each interval or day by its start.
 
-### Output (5-minute records)
-- Dims `(time, station_id)` with the coords above; one variable per `-v`, named `precip`, `temperature`, `humidity`, `pressure` or by its TAHMO code, with TAHMO's description as `long_name` and its units (`lb` in `percent`, `lv` in `mV`). `precip` is a rate in `mm day-1` (each 5-minute amount × 288), as in `--daily`.
-- `time` is every 5-minute interval from start-time 00:00 to end-time 23:55 UTC, labelled by its start; `data_interval` `5 minute`.
-- Records failing TAHMO QC (flag > 2) and missing records are NaN; nothing is aggregated or filled. For hourly or other windows, run aggregate-temporal on the output.
-- A code with several sensors at once at a station (such as soil sensors at several depths) exits 1.
+Output: dims `(time, station_id)`, coords `latitude`, `longitude`, `name`, `country`; `featureType="timeSeries"`. Variables are named `precip`, `temperature`, `tmax`, `tmin` (`degree_Celsius`), `humidity` (`1`), `pressure` (`kPa`), or by their TAHMO code with TAHMO's description as `long_name` and its units (`lb` in `percent`, `lv` in `mV`).
 
-### Notes
-- Station mode needs `TAHMO_API_USERNAME` and `TAHMO_API_PASSWORD` on every call; without them it exits 2.
-- Never fill missing days. A multi-day total with any missing day is NaN; report how many stations were complete (stderr prints this).
-- A failing station is dropped with a stderr line; no data at all exits 1.
+5-minute records (`-v`):
+- `time` is every 5-minute interval from start-time 00:00 to end-time 23:55 UTC; `data_interval` `5 minute`. Missing records are NaN.
+- For hourly windows, or daily ones with an `aggregation_coverage` instead of the complete-day rule, run aggregate-temporal on the output.
+
+Daily values (`--daily`):
+- `time` is every requested day; `data_interval` `1 day`. Day D holds the records stamped D H:05 to D+1 H:00.
+- A day is NaN unless all 288 records are present, for each variable separately (`tmax`/`tmin` follow `temperature`). stderr prints each station's complete days; report how many stations were complete, and never total over a missing day.
+
+Errors: no `TAHMO_API_USERNAME` / `TAHMO_API_PASSWORD` exits 2. A failing station is dropped with a stderr line; no data at all exits 1.
 
 ### Gold station history (`--gold-stations`)
 - Use it first for long historical station rainfall (seconds for all of Africa over 2015–2025); use station mode for recent days or other variables.
@@ -91,8 +90,8 @@ uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --probe-latest --gridded
 ### Example
 ```bash
 uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --list-stations --bbox 5.5/33.5/-5/42.5
-uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --station TA00025 --station TA00026 --start-time 2026-09-01 --end-time 2026-09-30 -o tahmo_kenya.zarr
+uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --station TA00025 --station TA00026 --daily --start-time 2026-09-01 --end-time 2026-09-30 -o tahmo_kenya.zarr
 uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --gold-stations --bbox 5.5/33.5/-5/42.5 --start-time 2024-03-01 --end-time 2024-05-31 -o tahmo_gold_kenya.zarr
 uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --gridded --start-time 2024-03-01 --end-time 2024-05-31 --bbox 5.5/33.5/-5/42.5 -o tahmo_grid_kenya.zarr
 ```
-Lists Kenya's stations, fetches September 2026 for two of them, then March–May 2024 rainfall over Kenya per station and as a grid.
+Lists Kenya's stations, fetches September 2026 daily values for two of them, then March–May 2024 rainfall over Kenya per station and as a grid.
