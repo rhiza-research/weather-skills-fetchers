@@ -62,7 +62,7 @@ Output: dims `(time, station_id)`, coords `latitude`, `longitude`, `name`, `coun
 
 5-minute records (`-v`):
 - `time` is every 5-minute interval from start-time 00:00 to end-time 23:55 UTC; `data_interval` `5 minute`. Missing records are NaN.
-- For hourly windows, or daily ones with an `aggregation_coverage` instead of the complete-day rule, run aggregate-temporal on the output.
+- For hourly windows, or daily ones with an `aggregation_coverage` instead of the complete-day rule, run aggregate-temporal on the output (`--period daily --day-start-hour 6` for 06 UTC days).
 
 Daily values (`--daily`):
 - `time` is every requested day; `data_interval` `1 day`. Day D holds the records stamped D H:05 to D+1 H:00.
