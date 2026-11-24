@@ -30,7 +30,7 @@ credentialed or source-specific fetcher only when it does not.
 | `chirps-fetch` | Default CHIRPS source: dynamical.org final + prelim fallback → `precip` Zarr |
 | `imerg-fetch` | Earthdata **daily** IMERG Final (`GPM_3IMERGDF`) → Zarr. All IMERG Late/Early comes from `dynamical-fetch`. |
 | `clim-fetch` | Climatology (mean + std) for a `--dataset` (`imerg_final`, `era5`, `chirps`, `ecmwf_ifs`, `oisst`, …), at a selected `--prediction-timedelta` lead and `--window` (days; correctly rolled up, centered, with circular padding if not pre-mirrored), expanded to a `--start-time`/`--end-time` window → Zarr. OISST SST is `--dataset oisst --variable sst`. |
-| `tahmo-fetch` | TAHMO station observations (daily-aggregated) → Zarr |
+| `tahmo-fetch` | TAHMO station observations: 5-minute records of any variable, or complete-day daily values with `--daily` → station Zarr. Requires credentials. |
 | `3dpaws-fetch` | 3D-PAWS station observations from a CHORDS portal (default: FEWS NET Kenya; daily precip, temperature, humidity, pressure, wind) → station Zarr. Requires credentials. |
 | `cumulus-fetch` | Cumulus AI operational ensemble precip (Aurora S2S run) — 30 members, 46 daily leads, 0.25° or 1° global (`--dataset precip`, `precip_1deg`, `precip_era5`), one init or a range of inits → Zarr. Requires credentials. |
 | `cumulus-downscaled-fetch` | Cumulus AI downscaled Aurora precip — 0.1° over East and West Africa, 46 daily leads, diffusion / flow-matching / UNet, ensemble mean or 10 members → Zarr. Requires credentials. |
