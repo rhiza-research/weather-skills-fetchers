@@ -57,6 +57,7 @@ def test_missing_tahmo_credentials_exits_2(tmp_path, fetch):
         with pytest.raises(SystemExit) as exc:
             run_skill(
                 fetch,
+                "--daily",
                 "--start-time",
                 "2026-01-01",
                 "--end-time",
@@ -80,6 +81,7 @@ def test_fetch_requires_station_or_bbox(tmp_path, fetch):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -152,6 +154,7 @@ def test_unknown_station_exits_2(tmp_path, mod, fetch):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -199,6 +202,7 @@ def test_fetch_writes_point_obs_zarr(tmp_path, mod, fetch):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -247,6 +251,7 @@ def test_fetch_by_bbox_skips_stations_outside(tmp_path, mod, fetch):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -286,6 +291,7 @@ def test_station_ids_take_precedence_over_bbox(tmp_path, mod, fetch):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -377,6 +383,39 @@ def test_raw_frame_keeps_five_minute_records(mod):
     assert frame["ra"].notna().all()
 
 
+def test_raw_frame_names_precip_and_gives_a_rate(mod):
+    """pr comes out as precip in mm day-1: a 5-minute amount times 288."""
+    pr = _five_minute_raw("pr", "2026-01-01", 0.1).assign(sensor="S1")
+    with patch.object(mod, "_fetch_raw", return_value=pr):
+        frame = mod._station_raw_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01", ["pr"])
+    assert list(frame.columns) == ["precip", "station_id"]
+    assert frame["precip"].iloc[0] == pytest.approx(28.8)
+
+
+def test_daily_variable_keeps_only_the_named_variables(tmp_path, mod, fetch):
+    out = tmp_path / "out.zarr"
+    daily = pd.DataFrame(
+        {"precip": [1.5], "temperature": [20.0], "station_id": "TA00001"},
+        index=pd.DatetimeIndex(["2026-01-01"], name="time"),
+    )
+    with (
+        patch.dict(os.environ, {"TAHMO_API_USERNAME": "user", "TAHMO_API_PASSWORD": "pass"}),
+        patch.object(mod, "_ensure_setup", side_effect=_fake_setup(MagicMock(), _stations())),
+        patch.object(mod, "_station_frame", return_value=daily),
+    ):
+        run_skill(
+            fetch,
+            "--start-time", "2026-01-01",
+            "--end-time", "2026-01-01",
+            "--station", "TA00001",
+            "--daily", "-v", "precip",
+            "-o", str(out),
+        )  # fmt: skip
+    ds = xr.open_zarr(out)
+    assert list(ds.data_vars) == ["precip"]
+    assert ds["precip"].attrs["data_interval"] == "1 day"
+
+
 def test_raw_frame_rejects_simultaneous_sensors(mod):
     st = pd.concat(
         [
@@ -388,7 +427,7 @@ def test_raw_frame_rejects_simultaneous_sensors(mod):
         mod._station_raw_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01", ["st"])
 
 
-def test_raw_variable_writes_five_minute_zarr(tmp_path, mod, fetch):
+def test_variable_writes_five_minute_zarr(tmp_path, mod, fetch):
     out = tmp_path / "out.zarr"
     frame = pd.DataFrame(
         {"lb": [100.0, 99.0], "lv": [8100.0, 8099.0], "station_id": "TA00001"},
@@ -407,8 +446,8 @@ def test_raw_variable_writes_five_minute_zarr(tmp_path, mod, fetch):
             "--start-time", "2026-01-01",
             "--end-time", "2026-01-01",
             "--station", "TA00001",
-            "--raw-variable", "lb",
-            "--raw-variable", "lv",
+            "--variable", "lb",
+            "--variable", "lv",
             "-o", str(out),
         )  # fmt: skip
 
@@ -420,9 +459,16 @@ def test_raw_variable_writes_five_minute_zarr(tmp_path, mod, fetch):
 
 
 @pytest.mark.parametrize(
-    "extra", [["--raw-variable", "zz"], ["--raw-variable", "lb", "--day-start-hour", "6"]]
+    "extra",
+    [
+        ["--variable", "zz"],
+        ["--variable", "lb", "--day-start-hour", "6"],
+        ["--variable", "tmax"],
+        ["--daily", "--variable", "lb"],
+        [],
+    ],
 )
-def test_raw_variable_usage_errors_exit_2(tmp_path, mod, fetch, extra):
+def test_variable_usage_errors_exit_2(tmp_path, mod, fetch, extra):
     with (
         patch.dict(os.environ, {"TAHMO_API_USERNAME": "user", "TAHMO_API_PASSWORD": "pass"}),
         patch.object(mod, "_ensure_setup", side_effect=_fake_setup(MagicMock(), _stations())),
@@ -455,6 +501,7 @@ def test_fetch_reports_complete_stations(tmp_path, mod, fetch, capsys):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -511,6 +558,7 @@ def test_fetch_writes_tmax_tmin_and_counts_complete_stations(tmp_path, mod, fetc
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -569,6 +617,7 @@ def test_day_start_hour_out_of_range_exits_2(tmp_path, fetch):
     with pytest.raises(SystemExit) as exc:
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-10-02",
             "--end-time",

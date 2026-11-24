@@ -10,7 +10,7 @@
 # [tool.uv.sources]
 # tahmo = { git = "https://github.com/rhiza-research/tahmo-api", rev = "8ed3adc22b5b7c53d08753e45676e9d4a0a52ab8" }
 # ///
-"""Fetch daily TAHMO weather-station observations as a weather-skills station Zarr."""
+"""Fetch TAHMO weather-station observations as a weather-skills station Zarr."""
 # Uses the TAHMO Python SDK. Credentials: TAHMO_API_USERNAME and TAHMO_API_PASSWORD.
 #
 # List stations in a region from the deployment API (no ``-o``)::
@@ -36,7 +36,7 @@ from weather_skills_core.standard_utils import bbox_subset, is_transient, requir
 from weather_skills_core.units import stamp_data_interval
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
-_SKILL_VERSION = "0.0.16"
+_SKILL_VERSION = "0.1.0"
 
 DEFAULT_WORKERS = 8
 _TAHMO_PREFIX = "TA"
@@ -84,7 +84,7 @@ _TAHMO_UNITS = {
     "degrees Celsius": "degree_Celsius",
     "degree Celsius": "degree_Celsius",
 }
-# Metadata for --raw-variable codes that getVariables() lacks or labels "-".
+# Metadata for --variable codes that getVariables() lacks or labels "-".
 _RAW_META = {
     "lb": {"units": "percent"},
     "lv": {"description": "Logger battery voltage", "units": "mV"},
@@ -424,11 +424,15 @@ def _station_raw_frame(api, station_id: str, start: str, end: str, codes):
         if (sensors > 1).any():
             raise DataError(
                 f"{station_id}: {code!r} has several sensors at once "
-                f"({', '.join(sorted(raw['sensor'].unique()))}); --raw-variable takes "
+                f"({', '.join(sorted(raw['sensor'].unique()))}); --variable takes "
                 "codes with one sensor per station."
             )
         raw = raw.sort_values(["time", "quality"]).drop_duplicates("time")
-        columns[code] = raw.set_index("time")["value"]
+        values = raw.set_index("time")["value"]
+        # A 5-minute rain amount (mm) as a rate, so precip is mm day-1 in both modes.
+        if code == "pr":
+            values = values * SAMPLES_PER_DAY
+        columns[VAR_MAP.get(code, code)] = values
     if not columns:
         return None
     frame = pd.DataFrame(columns)
@@ -559,12 +563,23 @@ def _ensure_setup(state):
     ),
 )
 @weather_skill.argument(
-    "--raw-variable",
+    "-v",
+    "--variable",
     action="append",
     metavar="CODE",
     help=(
-        "TAHMO variable code (repeatable), e.g. lb, lv, ra. Writes the station's "
-        "5-minute records of these codes instead of daily values."
+        "Variable to fetch (repeatable): precip, temperature, humidity, pressure, "
+        "tmax, tmin (--daily only), or any TAHMO code such as ra, lb, lv."
+    ),
+)
+@weather_skill.argument(
+    "--daily",
+    action="store_true",
+    default=False,
+    help=(
+        "Write complete-day values (only days where all 288 records passed QC) "
+        "instead of 5-minute records. Only precip, temperature, tmax, tmin, "
+        "humidity and pressure have them; without -v, all six."
     ),
 )
 @weather_skill.argument(
@@ -615,27 +630,34 @@ def fetch(
     bbox,
     station,
     day_start_hour,
-    raw_variable,
+    variable,
+    daily,
     gridded,
     gold_stations,
     list_stations,
     probe_latest,
     **kwargs,
 ):
-    """Fetch daily TAHMO weather-station observations as a weather-skills station Zarr."""
+    """Fetch TAHMO weather-station observations as a weather-skills station Zarr."""
     import pandas as pd
     import xarray as xr
 
     if not 0 <= day_start_hour <= 23:
         raise UsageError(f"--day-start-hour must be 0-23, got {day_start_hour}.")
 
-    if raw_variable and (
-        gridded or gold_stations or list_stations or probe_latest is not None or day_start_hour
-    ):
+    if variable and (gridded or gold_stations or list_stations or probe_latest is not None):
         raise UsageError(
-            "--raw-variable takes only --station, --bbox and the times; not --gridded, "
-            "--gold-stations, --list-stations, --probe-latest or --day-start-hour."
+            "--variable takes only --station, --bbox and the times; not --gridded, "
+            "--gold-stations, --list-stations or --probe-latest."
         )
+    fetching = not (gridded or gold_stations or list_stations or probe_latest is not None)
+    if fetching and not (variable or daily):
+        raise UsageError(
+            "pass -v VAR (repeatable) for 5-minute records, or --daily for complete-day "
+            "values (precip, temperature, tmax, tmin, humidity, pressure)."
+        )
+    if fetching and day_start_hour and not daily:
+        raise UsageError("--day-start-hour sets when each day starts; it needs --daily.")
 
     if gold_stations:
         if gridded or list_stations or probe_latest is not None:
@@ -673,13 +695,27 @@ def fetch(
         raise UsageError("pass --station ID (repeatable) and/or --bbox N/W/S/E.")
 
     api, stations, var_meta = _ensure_setup({})
-    if raw_variable:
+    # pr, te, rh, ap are also accepted under their standard names.
+    names = [VAR_MAP.get(v, v) for v in variable or []]
+    code_for = {name: code for code, name in VAR_MAP.items()}
+    codes = [code_for.get(n, n) for n in names]
+    if daily:
+        no_daily = [n for n in names if n not in DAILY_AGG]
+        if no_daily:
+            raise UsageError(
+                f"--daily has complete-day values only for {', '.join(DAILY_AGG)}; not for "
+                f"{', '.join(no_daily)}. Drop --daily for 5-minute records."
+            )
+    else:
+        extremes = [n for n in names if n in DERIVED]
+        if extremes:
+            raise UsageError(f"{', '.join(extremes)} are daily extremes; add --daily.")
         # lv is recorded but missing from getVariables().
-        unknown = sorted(set(raw_variable) - set(var_meta) - set(_RAW_META))
+        unknown = sorted(set(codes) - set(var_meta) - set(_RAW_META))
         if unknown:
             raise UsageError(
-                f"unknown --raw-variable {', '.join(unknown)}. Choose from: "
-                + ", ".join(sorted(set(var_meta) | set(_RAW_META)))
+                f"unknown --variable {', '.join(unknown)}. Choose from: "
+                + ", ".join(sorted(set(VAR_MAP.values()) | set(var_meta) | set(_RAW_META)))
             )
 
     if list_stations:
@@ -734,26 +770,29 @@ def fetch(
     selected = _select_stations(stations, station, bbox)
     start = start_time.isoformat()
     end = end_time.isoformat()
-    step = "5-minute steps" if raw_variable else "days"
+    step = "days" if daily else "5-minute steps"
     print(
         f"Fetching {len(selected)} TAHMO station(s) {start} → {end}, "
         + (
-            f"5-minute records of {', '.join(raw_variable)}"
-            if raw_variable
-            else f"days starting {day_start_hour:02d}:00 UTC"
+            f"days starting {day_start_hour:02d}:00 UTC"
+            if daily
+            else f"5-minute records of {', '.join(names)}"
         ),
         file=sys.stderr,
     )
 
     def _fetch_one(row):
         sid = row["code"]
-        if raw_variable:
-            daily = _station_raw_frame(api, sid, start, end, raw_variable)
+        if daily:
+            frame = _station_frame(api, sid, start, end, day_start_hour)
+            if frame is not None and names:
+                keep = [n for n in names if n in frame.columns]
+                frame = frame[keep + ["station_id"]] if keep else None
         else:
-            daily = _station_frame(api, sid, start, end, day_start_hour)
-        if daily is None:
+            frame = _station_raw_frame(api, sid, start, end, codes)
+        if frame is None:
             return None
-        return daily, {
+        return frame, {
             "station_id": sid,
             "latitude": float(row["location_latitude"]),
             "longitude": float(row["location_longitude"]),
@@ -776,11 +815,11 @@ def fetch(
                 continue
             if result is None:
                 continue
-            daily, meta_row = result
-            frames.append(daily)
+            frame, meta_row = result
+            frames.append(frame)
             meta_rows.append(meta_row)
-            complete = int(daily.drop(columns="station_id").notna().any(axis=1).sum())
-            print(f"{sid}: {complete}/{len(daily)} {step} with a complete record", file=sys.stderr)
+            complete = int(frame.drop(columns="station_id").notna().any(axis=1).sum())
+            print(f"{sid}: {complete}/{len(frame)} {step} with a complete record", file=sys.stderr)
 
     if not frames:
         raise DataError("no data returned for any station.")
@@ -803,9 +842,9 @@ def fetch(
         standard_name="time",
         axis="T",
         comment=(
-            "each label is the start of a 5-minute interval, UTC"
-            if raw_variable
-            else f"day D covers D {day_start_hour:02d}:00 to D+1 {day_start_hour:02d}:00 UTC"
+            f"day D covers D {day_start_hour:02d}:00 to D+1 {day_start_hour:02d}:00 UTC"
+            if daily
+            else "each label is the start of a 5-minute interval, UTC"
         ),
     )
     ds["station_id"].attrs.update(cf_role="timeseries_id", long_name="TAHMO station identifier")
@@ -844,7 +883,7 @@ def fetch(
     )
     # A station is complete when it reported every requested step; multi-day
     # totals are only meaningful for those (missing steps are never filled).
-    n_steps = ((end_time - start_time).days + 1) * (SAMPLES_PER_DAY if raw_variable else 1)
+    n_steps = ((end_time - start_time).days + 1) * (1 if daily else SAMPLES_PER_DAY)
     for name in sorted(ds.data_vars):
         complete = int((ds[name].notnull().sum("time") == n_steps).sum())
         print(
@@ -852,7 +891,7 @@ def fetch(
             f"(all {n_steps} {step} {start} → {end})",
             file=sys.stderr,
         )
-    return stamp_data_interval(ds, period="5 minutes" if raw_variable else "1 day")
+    return stamp_data_interval(ds, period="1 day" if daily else "5 minutes")
 
 
 if __name__ == "__main__":
