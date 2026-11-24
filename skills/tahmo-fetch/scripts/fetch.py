@@ -36,7 +36,7 @@ from weather_skills_core.standard_utils import bbox_subset, is_transient, requir
 from weather_skills_core.units import stamp_data_interval
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
-_SKILL_VERSION = "0.1.2"
+_SKILL_VERSION = "0.1.3"
 
 DEFAULT_WORKERS = 8
 _TAHMO_PREFIX = "TA"
@@ -68,6 +68,8 @@ EXTREMES = {
 # as the precip sum: a gap removes part of the diurnal cycle (e.g. the warm
 # afternoon), so a partial-day mean is a biased estimate, not an observation.
 SAMPLES_PER_DAY = 288
+# A 5-minute rain amount (mm) below this counts as dry when looking for a blocked gauge.
+DRY_MM = 0.01
 # (standard_name, units). Always CF/pint strings — TAHMO getVariables() uses
 # "-" for dimensionless (relative humidity) and that fails pint.quantify().
 CF_META = {
@@ -402,11 +404,11 @@ def _merge_gauges(raw, keys):
     """Return one value per ``keys`` from redundant sensors: the mean of their QC'd readings.
 
     Only readings with the best QC flag at that stamp count. Among those, a rain
-    gauge reading 0 while another reads rain is taken as blocked and left out.
+    gauge reading under DRY_MM while another reads rain is taken as blocked and left out.
     """
     raw = raw[raw["quality"] == raw.groupby(keys)["quality"].transform("min")]
-    wet = raw.groupby(keys)["value"].transform("max") > 0
-    blocked = (raw["variable"] == "pr") & wet & (raw["value"] == 0)
+    wet = raw.groupby(keys)["value"].transform("max") >= DRY_MM
+    blocked = (raw["variable"] == "pr") & wet & (raw["value"] < DRY_MM)
     return raw[~blocked].groupby(keys)["value"].mean()
 
 
