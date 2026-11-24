@@ -357,6 +357,88 @@ def test_midnight_stamp_closes_previous_utc_day(mod):
     assert daily.loc["2026-01-01", "precip"] == pytest.approx(5.0)
 
 
+def test_raw_frame_keeps_five_minute_records(mod):
+    """One call per code; records labelled at interval start; gaps and failed QC are NaN."""
+    lv = _five_minute_raw("lv", "2026-01-01", 8100.0, drop=1).assign(sensor="logger")
+    lv.loc[lv.index[0], "quality"] = 3  # 00:05 stamp fails QC
+    ra = _five_minute_raw("ra", "2026-01-01", 250.0).assign(sensor="S1")
+    with patch.object(mod, "_fetch_raw", side_effect=[lv, ra]) as fetch_raw:
+        frame = mod._station_raw_frame(
+            MagicMock(), "TA00001", "2026-01-01", "2026-01-01", ["lv", "ra"]
+        )
+
+    assert [c.args[4] for c in fetch_raw.call_args_list] == [["lv"], ["ra"]]
+    assert list(frame.index) == list(
+        pd.date_range("2026-01-01", periods=288, freq="5min", name="time")
+    )
+    assert pd.isna(frame.loc["2026-01-01 00:00", "lv"])  # failed QC
+    assert frame.loc["2026-01-01 00:05", "lv"] == 8100.0
+    assert pd.isna(frame.loc["2026-01-01 23:55", "lv"])  # missing record
+    assert frame["ra"].notna().all()
+
+
+def test_raw_frame_rejects_simultaneous_sensors(mod):
+    st = pd.concat(
+        [
+            _five_minute_raw("st", "2026-01-01", 20.0).assign(sensor="S1"),
+            _five_minute_raw("st", "2026-01-01", 21.0).assign(sensor="S2"),
+        ]
+    )
+    with patch.object(mod, "_fetch_raw", return_value=st), pytest.raises(mod.DataError):
+        mod._station_raw_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01", ["st"])
+
+
+def test_raw_variable_writes_five_minute_zarr(tmp_path, mod, fetch):
+    out = tmp_path / "out.zarr"
+    frame = pd.DataFrame(
+        {"lb": [100.0, 99.0], "lv": [8100.0, 8099.0], "station_id": "TA00001"},
+        index=pd.DatetimeIndex(["2026-01-01 00:00", "2026-01-01 00:05"], name="time"),
+    )
+    var_meta = {"lb": {"units": "-", "description": "Logger battery percentage"}}
+    with (
+        patch.dict(os.environ, {"TAHMO_API_USERNAME": "user", "TAHMO_API_PASSWORD": "pass"}),
+        patch.object(
+            mod, "_ensure_setup", side_effect=_fake_setup(MagicMock(), _stations(), var_meta)
+        ),
+        patch.object(mod, "_station_raw_frame", return_value=frame),
+    ):
+        run_skill(
+            fetch,
+            "--start-time", "2026-01-01",
+            "--end-time", "2026-01-01",
+            "--station", "TA00001",
+            "--raw-variable", "lb",
+            "--raw-variable", "lv",
+            "-o", str(out),
+        )  # fmt: skip
+
+    ds = xr.open_zarr(out)
+    assert ds["lb"].attrs["units"] == "percent"
+    assert ds["lv"].attrs["units"] == "mV"
+    assert ds["lv"].attrs["long_name"] == "Logger battery voltage"
+    assert ds["lb"].attrs["data_interval"] == "5 minute"
+
+
+@pytest.mark.parametrize(
+    "extra", [["--raw-variable", "zz"], ["--raw-variable", "lb", "--day-start-hour", "6"]]
+)
+def test_raw_variable_usage_errors_exit_2(tmp_path, mod, fetch, extra):
+    with (
+        patch.dict(os.environ, {"TAHMO_API_USERNAME": "user", "TAHMO_API_PASSWORD": "pass"}),
+        patch.object(mod, "_ensure_setup", side_effect=_fake_setup(MagicMock(), _stations())),
+        pytest.raises(SystemExit) as exc,
+    ):
+        run_skill(
+            fetch,
+            "--start-time", "2026-01-01",
+            "--end-time", "2026-01-01",
+            "--station", "TA00001",
+            *extra,
+            "-o", str(tmp_path / "out.zarr"),
+        )  # fmt: skip
+    assert exc.value.code == 2
+
+
 def test_fetch_reports_complete_stations(tmp_path, mod, fetch, capsys):
     """Two of three requested days reported: the station is not complete."""
     daily = pd.DataFrame(

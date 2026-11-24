@@ -1,11 +1,11 @@
 ---
 name: tahmo-fetch
-description: "Fetch daily TAHMO weather-station observations (rainfall, mean, max and min temperature, humidity, pressure) from the Trans-African Hydro-Meteorological Observatory network, for chosen station ids or every station in a lat/lon box (2015 to present), as a weather-skills station Zarr. Can also list the stations in a box, or read Sheerwater's historical QC'd daily TAHMO rainfall (2015-2025) from private GCS, per station with --gold-stations or as 0.25° cell means with --gridded. Needs TAHMO credentials (station mode) or Google Cloud credentials (--gold-stations, --gridded). Use when a task needs in-situ station data in Africa, for example to compare against gridded satellite or forecast data."
+description: "Fetch daily TAHMO weather-station observations (rainfall, mean, max and min temperature, humidity, pressure), or raw 5-minute records of any TAHMO variable code (e.g. radiation, logger battery), from the Trans-African Hydro-Meteorological Observatory network, for chosen station ids or every station in a lat/lon box (2015 to present), as a weather-skills station Zarr. Can also list the stations in a box, or read Sheerwater's historical QC'd daily TAHMO rainfall (2015-2025) from private GCS, per station with --gold-stations or as 0.25° cell means with --gridded. Needs TAHMO credentials (station mode) or Google Cloud credentials (--gold-stations, --gridded). Use when a task needs in-situ station data in Africa, for example to compare against gridded satellite or forecast data."
 license: MIT
 compatibility: Requires Python 3.12 and uv. Installs the TAHMO Python SDK from GitHub (git+https://github.com/rhiza-research/tahmo-api). Station mode needs TAHMO_API_USERNAME and TAHMO_API_PASSWORD; --gold-stations and --gridded need read access to gs://sheerwater-datalake/hindcasts via GCLOUD_SERVICE_CREDENTIALS (service-account JSON contents) or GOOGLE_APPLICATION_CREDENTIALS (path to that JSON).
 allowed-tools: Bash(uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py *)
 metadata:
-  version: "0.0.15"
+  version: "0.0.16"
   catalog-group: fetchers
   variables: "precip temperature tmax tmin humidity pressure"
   required-env: "TAHMO_API_USERNAME TAHMO_API_PASSWORD"
@@ -22,6 +22,8 @@ Fetches TAHMO station records as daily values in a station Zarr, or lists the st
 uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --list-stations --bbox N/W/S/E
 # Fetch chosen stations, or every TA station in a box
 uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py (--station ID [--station ID ...] | --bbox N/W/S/E) --start-time YYYY-MM-DD --end-time YYYY-MM-DD [--day-start-hour H] [--workers N] -o OUT.zarr
+# 5-minute records of chosen TAHMO variable codes
+uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py (--station ID [--station ID ...] | --bbox N/W/S/E) --raw-variable CODE [--raw-variable CODE ...] --start-time YYYY-MM-DD --end-time YYYY-MM-DD -o OUT.zarr
 # Historical station rainfall, no TAHMO login
 uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --gold-stations [--station ID ... | --bbox N/W/S/E] --start-time YYYY-MM-DD --end-time YYYY-MM-DD -o OUT.zarr
 # Historical gridded rainfall, no TAHMO login
@@ -41,6 +43,7 @@ uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --probe-latest --gridded
 - `--bbox` — `N/W/S/E`. Without `--station`, selects every `TA` station in the box.
 - `--start-time`, `--end-time` — inclusive days, `YYYY-MM-DD`.
 - `--day-start-hour` — UTC hour each day starts at (default 0). With 6, day D runs 06 UTC D to 06 UTC D+1, as KMSA uses.
+- `--raw-variable` — TAHMO variable code, repeatable (e.g. `ra` shortwave radiation, `lb` logger battery %, `lv` logger battery voltage). Writes 5-minute records instead of daily values (below). An unknown code exits 2 and lists the codes TAHMO knows.
 - `--workers` — concurrent station downloads (default 8). Lower it if TAHMO throttles.
 - `--gold-stations` — read the gold station store (below). Takes `--station`, `--bbox` and the times; with neither, every station.
 - `--gridded` — read the gridded store (below). Takes only the times and `--bbox`.
@@ -54,6 +57,12 @@ uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --probe-latest --gridded
 - Each station starts after March 2015 and has gaps. Only records with TAHMO quality flag <= 2 are used.
 - Stamps mark the end of each 5-minute interval, so day D holds D H:05 to D+1 H:00.
 - A day is NaN unless all 288 records passed QC, for each variable separately (`tmax`/`tmin` follow `temperature`).
+
+### Output (`--raw-variable`)
+- Dims `(time, station_id)` with the station-mode coords; one variable per code, named by the code, with TAHMO's description as `long_name` and its units (`lb` in `percent`, `lv` in `mV`).
+- `time` is every 5-minute interval from start-time 00:00 to end-time 23:55 UTC, labelled by its start; `data_interval` `5 minute`.
+- Records failing TAHMO QC (flag > 2) and missing records are NaN; nothing is aggregated or filled.
+- A code with several sensors at once at a station (such as soil sensors at several depths) exits 1.
 
 ### Notes
 - Station mode needs `TAHMO_API_USERNAME` and `TAHMO_API_PASSWORD` on every call; without them it exits 2.
