@@ -393,11 +393,12 @@ def test_raw_frame_names_precip_and_gives_a_rate(mod):
 
 
 def test_redundant_rain_gauges_skip_a_blocked_gauge_and_average_the_rest(mod):
-    """Two rain gauges: a 0 beside rain is dropped; otherwise the readings are averaged."""
+    """Two rain gauges: best QC flag first; a 0 beside rain is dropped; the rest are averaged."""
     s1 = _five_minute_raw("pr", "2026-01-01", 0.0).assign(sensor="S1")
-    s2 = _five_minute_raw("pr", "2026-01-01", 0.0).assign(sensor="S2", quality=2)
+    s2 = _five_minute_raw("pr", "2026-01-01", 0.0).assign(sensor="S2")
     s1.loc[0, "value"] = 0.1  # S2 reads 0: blocked, S1 alone
     s1.loc[1, "value"], s2.loc[1, "value"] = 0.1, 0.3  # both wet: mean 0.2
+    s2.loc[2, "value"], s2.loc[2, "quality"] = 0.5, 2  # worse flag than S1's 0: S1 wins
     raw = pd.concat([s1, s2])
     with patch.object(mod, "_fetch_raw", return_value=raw):
         frame = mod._station_raw_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01", ["pr"])

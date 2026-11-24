@@ -36,7 +36,7 @@ from weather_skills_core.standard_utils import bbox_subset, is_transient, requir
 from weather_skills_core.units import stamp_data_interval
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
-_SKILL_VERSION = "0.1.1"
+_SKILL_VERSION = "0.1.2"
 
 DEFAULT_WORKERS = 8
 _TAHMO_PREFIX = "TA"
@@ -401,9 +401,10 @@ def _fetch_raw(api, station_id: str, start: str, end: str, variables=None):
 def _merge_gauges(raw, keys):
     """Return one value per ``keys`` from redundant sensors: the mean of their QC'd readings.
 
-    A rain gauge reading 0 while another at the station reads rain is taken as
-    blocked and left out of that mean.
+    Only readings with the best QC flag at that stamp count. Among those, a rain
+    gauge reading 0 while another reads rain is taken as blocked and left out.
     """
+    raw = raw[raw["quality"] == raw.groupby(keys)["quality"].transform("min")]
     wet = raw.groupby(keys)["value"].transform("max") > 0
     blocked = (raw["variable"] == "pr") & wet & (raw["value"] == 0)
     return raw[~blocked].groupby(keys)["value"].mean()

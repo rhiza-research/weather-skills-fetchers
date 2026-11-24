@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires Python 3.12 and uv. Installs the TAHMO Python SDK from GitHub (git+https://github.com/rhiza-research/tahmo-api). Station mode needs TAHMO_API_USERNAME and TAHMO_API_PASSWORD; --gold-stations and --gridded need read access to gs://sheerwater-datalake/hindcasts via GCLOUD_SERVICE_CREDENTIALS (service-account JSON contents) or GOOGLE_APPLICATION_CREDENTIALS (path to that JSON).
 allowed-tools: Bash(uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py *)
 metadata:
-  version: "0.1.1"
+  version: "0.1.2"
   catalog-group: fetchers
   variables: "precip temperature tmax tmin humidity pressure"
   required-env: "TAHMO_API_USERNAME TAHMO_API_PASSWORD"
@@ -58,7 +58,7 @@ uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --probe-latest --gridded
 - Each station starts after March 2015 and has gaps. Only records with TAHMO quality flag <= 2 are used.
 - Stamps mark the end of each 5-minute interval, so day D holds D H:05 to D+1 H:00.
 - A day is NaN unless all 288 records passed QC, for each variable separately (`tmax`/`tmin` follow `temperature`).
-- A station with several sensors of one variable gets their mean per 5-minute record, in both modes. A rain gauge reading 0 while another reads rain is taken as blocked and left out.
+- A station with several sensors of one variable gets, per 5-minute record and in both modes, the mean of the readings with the best QC flag. Among those, a rain gauge reading 0 while another reads rain is taken as blocked and left out.
 
 ### Output (5-minute records)
 - Dims `(time, station_id)` with the coords above; one variable per `-v`, named `precip`, `temperature`, `humidity`, `pressure` or by its TAHMO code, with TAHMO's description as `long_name` and its units (`lb` in `percent`, `lv` in `mV`). `precip` is a rate in `mm day-1` (each 5-minute amount × 288), as in `--daily`.
