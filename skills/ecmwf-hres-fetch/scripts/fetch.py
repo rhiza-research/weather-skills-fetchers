@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
-#   "weather-skills-core>=0.3.3",
+#   "weather-skills-core>=0.4.0",
 #   # >=0.3.34 for the IFS Cycle 50r1 (2026-05-12) date-aware oper/scda
 #   # stream fix in Client.patch_stream — older pins misroute 06/18Z runs.
 #   "ecmwf-opendata==0.3.34",
@@ -23,28 +23,28 @@ import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
+import numpy as np
 from weather_skills_core import DataError, UsageError, weather_skill
 from weather_skills_core.cf import stamp_cf_attrs
 from weather_skills_core.standard_utils import bbox_subset
 from weather_skills_core.units import (
     convert_dataarray,
+    data_interval_of,
     precip_amounts_to_rates,
     stamp_data_interval,
     to_standard_units,
 )
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
-_SKILL_VERSION = "0.0.7"
+_SKILL_VERSION = "0.0.15"
 
 # HRES steps
 _FULL_RUN_STEPS = list(range(0, 144 + 1, 3)) + list(range(150, 360 + 1, 6))
 _SHORT_CUTOFF_STEPS = list(range(0, 144 + 1, 3))
 
-# ECMWF Open Data answers load with "503 Slow Down"; ecmwf-opendata's default
-# (500 tries, 120 s apart) left a chat waiting 30 min. Three tries 10 s apart,
-# then the next source (the AWS mirror) is tried.
-_OPEN_DATA_TRIES = 3
-_OPEN_DATA_RETRY_S = 10
+# data.ecmwf.int keeps only the inits of the last 4 days (today included);
+# older inits are only on the AWS mirror (from 2024-02-28).
+_ECMWF_DAYS_KEPT = 4
 
 # Every Open Data level from 1000 to 50 hPa. 10 hPa exists only since IFS
 # Cycle 50r1 (2026-05-12), so it is not requested: older inits would fail.
@@ -299,6 +299,17 @@ def _standardize(ds):
         if name in ds.data_vars:
             ds[name] = _to_celsius(ds[name])
     ds = precip_amounts_to_rates(ds)
+    # Without tp nothing is deaccumulated and instant fields keep their labels.
+    # On uneven leads (3- then 6-hourly) give each sample the cell [s, next
+    # lead) like the tp rates, so a day bin holds the samples labelled in that
+    # day; stamp_data_interval would infer cells ending at each step.
+    if "step" in ds.dims and "bounds" not in ds["step"].attrs and data_interval_of(ds) is None:
+        leads = ds["step"].values
+        gaps = np.diff(leads)
+        if len(set(gaps)) > 1:
+            ends = np.append(leads[1:], leads[-1] + gaps[-1])
+            ds = ds.assign_coords(step_bounds=(("step", "nv"), np.stack([leads, ends], axis=1)))
+            ds["step"].attrs["bounds"] = "step_bounds"
     return stamp_data_interval(ds, dim="step")
 
 
@@ -414,6 +425,7 @@ def fetch(bbox, date, start_time, end_time, run, variable, probe_latest, max_lea
 
     # One init at a time: each is downloaded, cut to the bbox and loaded, and its
     # GRIB files are deleted before the next init.
+    oldest_on_ecmwf = dt.datetime.now(dt.UTC).date() - dt.timedelta(days=_ECMWF_DAYS_KEPT - 1)
     pieces = []
     for init in inits:
         date_iso = init.isoformat()
@@ -430,27 +442,33 @@ def fetch(bbox, date, start_time, end_time, run, variable, probe_latest, max_lea
                     req = _build_request(date_iso, run, group_vars, level_type, levels, steps)
                     grib = tmp / f"hres_{i}.grib2"
                     print(f"Retrieving {', '.join(group_vars)} ({level_type})...", file=sys.stderr)
-                    # data.ecmwf.int keeps only the last ~4 days of inits; the AWS
-                    # mirror holds the archive (from 2023). Try ECMWF first (fastest
-                    # for fresh runs), then AWS.
+                    # Recent inits try ECMWF first (fastest), then AWS; older inits go
+                    # straight to AWS since data.ecmwf.int keeps only the last 4 days. Each
+                    # source gets one attempt: under load both answer "503 Slow Down", and
+                    # waiting it out leaves the user waiting for nothing.
+                    sources = ("ecmwf", "aws") if init >= oldest_on_ecmwf else ("aws",)
                     errors = []
-                    for source in ("ecmwf", "aws"):
+                    for source in sources:
                         try:
-                            client = Client(
-                                source=source,
-                                maximum_retries=_OPEN_DATA_TRIES,
-                                retry_after=_OPEN_DATA_RETRY_S,
-                                use_server_retry_after=False,
-                            )
+                            client = Client(source=source, maximum_retries=1)
                             client.retrieve(request=req, target=str(grib))
                             break
                         except Exception as exc:  # noqa: BLE001
                             errors.append(f"{source}: {exc}")
                     else:
+                        if any("503" in e or "SlowDown" in e for e in errors):
+                            hint = (
+                                "The server is rate-limiting requests (503 Slow Down): fetch "
+                                "one init at a time and try again in a few minutes."
+                            )
+                        else:
+                            hint = (
+                                "The init may not be published yet (recent inits lag ~6-9h; "
+                                "try --probe-latest) or this is a transport problem."
+                            )
                         raise DataError(
                             f"ECMWF Open Data retrieval failed for init {date_iso} {run:02d}Z "
-                            f"({'; '.join(errors)}). The init may not be published yet (recent "
-                            "inits lag ~6-9h; try --probe-latest) or this is a transport problem."
+                            f"({'; '.join(errors)}). {hint}"
                         )
                     ds = _promote_vertical(_open_grib(grib))
                     parts.append(_rename_to_short(ds, group_vars))

@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
-#   "weather-skills-core>=0.3.3",
+#   "weather-skills-core>=0.4.0",
 #   "dynamical-catalog==1.0.1",
 #   "ecmwf-datastores-client==0.4.2",
 #   "requests",
@@ -40,7 +40,7 @@ from weather_skills_core.units import (
 )
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
-_SKILL_VERSION = "0.0.7"
+_SKILL_VERSION = "0.0.15"
 
 _PROBE_POLL_SECONDS = 30
 _PROBE_POLL_MAX_SECONDS = 3600
@@ -213,8 +213,8 @@ _DROP_COORDS = (
     "spatial_ref",
 )
 
-# S2S short name → catalog field. Fluxes (ECDS accumulated J m-2 vs catalog
-# mean W m-2), 6-hour max/min, static masks, ocean, and pv stay on ECDS.
+# S2S short name → catalog field. Catalog fluxes are daily-mean W m-2 (ECDS: J m-2
+# since init). 6-hour max/min, static masks, ocean, and pv stay on ECDS.
 _CATALOG_SURFACE = {
     "precip": "precipitation_surface",
     "t2m": "average_temperature_2m",
@@ -223,7 +223,7 @@ _CATALOG_SURFACE = {
     "u10": "wind_u_10m",
     "v10": "wind_v_10m",
     "msl": "pressure_reduced_to_mean_sea_level",
-    "cape": "average_convective_available_potential_energy_atmosphere",
+    "cape": "average_convective_available_potential_energy_surface",
     "tcw": "total_column_water_atmosphere",
     "skt": "skin_temperature_surface",
     "tcc": "total_cloud_cover_atmosphere",
@@ -242,6 +242,13 @@ _CATALOG_SURFACE = {
     "nsss": "northward_turbulent_surface_stress",
     "ro": "runoff_water_equivalent_surface",
     "sro": "runoff_surface",
+    "ssrd": "downward_short_wave_radiation_flux_surface",
+    "ssr": "net_short_wave_radiation_flux_surface",
+    "strd": "downward_long_wave_radiation_flux_surface",
+    "str": "net_long_wave_radiation_flux_surface",
+    "ttr": "net_long_wave_radiation_flux_top_of_atmosphere",
+    "sshf": "downward_sensible_heat_flux_surface",
+    "slhf": "downward_latent_heat_flux_surface",
 }
 _CATALOG_PRESSURE = {
     "gh": "geopotential_height",
@@ -511,6 +518,14 @@ def _fetch_catalog(init: dt.date | None, bbox, names: list[str], windows=()):
         have = ", ".join(ds.data_vars) if list(ds.data_vars) else "none"
         raise DataError(f"{_DATASET} did not contain {', '.join(missing)} (opened: {have}).")
     ds = ds[names]
+    # Daily means fetched with instant fields keep lead 0, where each mean ends:
+    # every cell is [previous lead, s).
+    empty = [name for name in ds.data_vars if bool(ds[name].isel(step=0).isnull().all())]
+    if empty and len(empty) < len(ds.data_vars) and ds.sizes["step"] > 1:
+        leads = ds["step"].values
+        starts = np.concatenate([[leads[0] - (leads[1] - leads[0])], leads[:-1]])
+        ds = ds.assign_coords(step_bounds=(("step", "nv"), np.stack([starts, leads], axis=1)))
+        ds["step"].attrs["bounds"] = "step_bounds"
     ds.attrs.update(Conventions="CF-1.13", weather_skills_source="ecmwf-s2s")
     return _standardize_catalog(ds)
 
@@ -761,7 +776,7 @@ def _is_s2s_embargo_error(exc: BaseException) -> bool:
         "S2S fields to retrieve. Pass several names in one flag (`-v precip t2m`), "
         "repeat `-v`, or comma-separate (`-v precip,t2m`). Most used first: precip "
         "(also tp), t2m, sst. Pressure-level: gh, t, u, v, w, q. Default precip. "
-        "Other names are cfgrib short names (sst, t, not ARCO 2m_temperature)."
+        "Other names are cfgrib short names (sst, t) or ECDS names (2_m_temperature)."
     ),
 )
 @weather_skill.argument(
@@ -771,9 +786,8 @@ def _is_s2s_embargo_error(exc: BaseException) -> bool:
     metavar="IDENT",
     probe=True,
     help=(
-        "Print the latest available YYYY-MM-DD (or none) on stdout and exit. "
-        "Does not download fields. Optional IDENT selects a product "
-        "(dataset id, IMERG late/final, …)."
+        "Print the latest init date (YYYY-MM-DD) on dynamical.org on stdout and exit. "
+        "Does not download fields. IDENT is ignored."
     ),
 )
 def fetch(bbox, date, start_time, end_time, variable, probe_latest, **kwargs):
@@ -1009,7 +1023,7 @@ def fetch(bbox, date, start_time, end_time, variable, probe_latest, **kwargs):
                     ens = xr.concat([pf, cf], dim="number").sortby("number")
                 else:
                     # Control-only fields keep a length-1 number axis so the merge
-                    # below leaves members 1..50 NaN instead of dropping `number`.
+                    # below leaves members 1..100 NaN instead of dropping `number`.
                     ens = cf.expand_dims("number")
                 if key[0] == "daily":
                     # cfgrib labels a 24 h mean at its window end; relabel to the
