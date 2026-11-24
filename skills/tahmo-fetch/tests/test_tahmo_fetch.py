@@ -392,6 +392,15 @@ def test_raw_frame_names_precip_and_gives_a_rate(mod):
     assert frame["precip"].iloc[0] == pytest.approx(28.8)
 
 
+def test_raw_frame_keeps_best_record_of_redundant_gauges(mod):
+    """Two rain gauges: one record per stamp, the better QC flag, as --daily does."""
+    good = _five_minute_raw("pr", "2026-01-01", 0.1).assign(sensor="S1")
+    worse = _five_minute_raw("pr", "2026-01-01", 0.5).assign(sensor="S2", quality=2)
+    with patch.object(mod, "_fetch_raw", return_value=pd.concat([worse, good])):
+        frame = mod._station_raw_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01", ["pr"])
+    assert frame["precip"].tolist() == pytest.approx([28.8] * 288)
+
+
 def test_daily_variable_keeps_only_the_named_variables(tmp_path, mod, fetch):
     out = tmp_path / "out.zarr"
     daily = pd.DataFrame(

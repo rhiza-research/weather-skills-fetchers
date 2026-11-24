@@ -420,14 +420,18 @@ def _station_raw_frame(api, station_id: str, start: str, end: str, codes):
         raw["time"] = pd.to_datetime(raw["time"], format="mixed", utc=True).dt.tz_convert(None)
         raw = raw[(raw["variable"] == code) & (raw["time"] > first) & (raw["time"] <= last)]
         raw = raw[raw["quality"] <= 2]
+        # Several sensors of a standard variable are redundant gauges: keep the
+        # best-quality record per stamp, as --daily does. For other codes they
+        # usually measure different things (soil depths), so refuse.
         sensors = raw.groupby("time")["sensor"].nunique()
-        if (sensors > 1).any():
+        if code not in VAR_MAP and (sensors > 1).any():
             raise DataError(
                 f"{station_id}: {code!r} has several sensors at once "
                 f"({', '.join(sorted(raw['sensor'].unique()))}); --variable takes "
                 "codes with one sensor per station."
             )
-        raw = raw.sort_values(["time", "quality"]).drop_duplicates("time")
+        # Equal flags: the lowest sensor id wins, as with --daily.
+        raw = raw.sort_values(["time", "quality", "sensor"]).drop_duplicates("time")
         values = raw.set_index("time")["value"]
         # A 5-minute rain amount (mm) as a rate, so precip is mm day-1 in both modes.
         if code == "pr":
@@ -473,8 +477,9 @@ def _station_frame(api, station_id: str, start: str, end: str, day_start_hour: i
     if raw.empty:
         return None
 
-    raw = raw.sort_values(["time", "variable", "quality"])
-    raw = raw.drop_duplicates(["time", "variable"], keep="first")
+    # Several sensors of one variable: keep the best QC flag, then the lowest sensor id.
+    order = ["time", "variable", "quality"] + (["sensor"] if "sensor" in raw.columns else [])
+    raw = raw.sort_values(order).drop_duplicates(["time", "variable"], keep="first")
     wide = raw.pivot(index="time", columns="variable", values="value")
     wide = wide.rename(columns=VAR_MAP)
     for name, source in DERIVED.items():
