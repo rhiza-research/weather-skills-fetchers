@@ -392,13 +392,27 @@ def test_raw_frame_names_precip_and_gives_a_rate(mod):
     assert frame["precip"].iloc[0] == pytest.approx(28.8)
 
 
-def test_raw_frame_keeps_best_record_of_redundant_gauges(mod):
-    """Two rain gauges: one record per stamp, the better QC flag, as --daily does."""
-    good = _five_minute_raw("pr", "2026-01-01", 0.1).assign(sensor="S1")
-    worse = _five_minute_raw("pr", "2026-01-01", 0.5).assign(sensor="S2", quality=2)
-    with patch.object(mod, "_fetch_raw", return_value=pd.concat([worse, good])):
+def test_redundant_rain_gauges_skip_a_blocked_gauge_and_average_the_rest(mod):
+    """Two rain gauges: a 0 beside rain is dropped; otherwise the readings are averaged."""
+    s1 = _five_minute_raw("pr", "2026-01-01", 0.0).assign(sensor="S1")
+    s2 = _five_minute_raw("pr", "2026-01-01", 0.0).assign(sensor="S2", quality=2)
+    s1.loc[0, "value"] = 0.1  # S2 reads 0: blocked, S1 alone
+    s1.loc[1, "value"], s2.loc[1, "value"] = 0.1, 0.3  # both wet: mean 0.2
+    raw = pd.concat([s1, s2])
+    with patch.object(mod, "_fetch_raw", return_value=raw):
         frame = mod._station_raw_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01", ["pr"])
-    assert frame["precip"].tolist() == pytest.approx([28.8] * 288)
+    with patch.object(mod, "_fetch_raw", return_value=raw):
+        daily = mod._station_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01")
+    assert frame["precip"].iloc[:3].tolist() == pytest.approx([28.8, 57.6, 0.0])
+    assert daily.loc["2026-01-01", "precip"] == pytest.approx(0.3)
+
+
+def test_redundant_temperature_sensors_are_averaged_zeros_included(mod):
+    t1 = _five_minute_raw("te", "2026-01-01", 0.0).assign(sensor="S1")
+    t2 = _five_minute_raw("te", "2026-01-01", 2.0).assign(sensor="S2")
+    with patch.object(mod, "_fetch_raw", return_value=pd.concat([t1, t2])):
+        daily = mod._station_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01")
+    assert daily.loc["2026-01-01", "temperature"] == pytest.approx(1.0)
 
 
 def test_daily_variable_keeps_only_the_named_variables(tmp_path, mod, fetch):

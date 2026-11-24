@@ -36,7 +36,7 @@ from weather_skills_core.standard_utils import bbox_subset, is_transient, requir
 from weather_skills_core.units import stamp_data_interval
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
-_SKILL_VERSION = "0.1.0"
+_SKILL_VERSION = "0.1.1"
 
 DEFAULT_WORKERS = 8
 _TAHMO_PREFIX = "TA"
@@ -398,6 +398,17 @@ def _fetch_raw(api, station_id: str, start: str, end: str, variables=None):
         )
 
 
+def _merge_gauges(raw, keys):
+    """Return one value per ``keys`` from redundant sensors: the mean of their QC'd readings.
+
+    A rain gauge reading 0 while another at the station reads rain is taken as
+    blocked and left out of that mean.
+    """
+    wet = raw.groupby(keys)["value"].transform("max") > 0
+    blocked = (raw["variable"] == "pr") & wet & (raw["value"] == 0)
+    return raw[~blocked].groupby(keys)["value"].mean()
+
+
 def _station_raw_frame(api, station_id: str, start: str, end: str, codes):
     """Return one station's 5-minute records for TAHMO variable ``codes``, or None.
 
@@ -420,9 +431,9 @@ def _station_raw_frame(api, station_id: str, start: str, end: str, codes):
         raw["time"] = pd.to_datetime(raw["time"], format="mixed", utc=True).dt.tz_convert(None)
         raw = raw[(raw["variable"] == code) & (raw["time"] > first) & (raw["time"] <= last)]
         raw = raw[raw["quality"] <= 2]
-        # Several sensors of a standard variable are redundant gauges: keep the
-        # best-quality record per stamp, as --daily does. For other codes they
-        # usually measure different things (soil depths), so refuse.
+        # Several sensors of a standard variable are redundant gauges, merged as
+        # --daily does. For other codes they usually measure different things
+        # (soil depths), so refuse.
         sensors = raw.groupby("time")["sensor"].nunique()
         if code not in VAR_MAP and (sensors > 1).any():
             raise DataError(
@@ -430,9 +441,7 @@ def _station_raw_frame(api, station_id: str, start: str, end: str, codes):
                 f"({', '.join(sorted(raw['sensor'].unique()))}); --variable takes "
                 "codes with one sensor per station."
             )
-        # Equal flags: the lowest sensor id wins, as with --daily.
-        raw = raw.sort_values(["time", "quality", "sensor"]).drop_duplicates("time")
-        values = raw.set_index("time")["value"]
+        values = _merge_gauges(raw, "time")
         # A 5-minute rain amount (mm) as a rate, so precip is mm day-1 in both modes.
         if code == "pr":
             values = values * SAMPLES_PER_DAY
@@ -477,10 +486,7 @@ def _station_frame(api, station_id: str, start: str, end: str, day_start_hour: i
     if raw.empty:
         return None
 
-    # Several sensors of one variable: keep the best QC flag, then the lowest sensor id.
-    order = ["time", "variable", "quality"] + (["sensor"] if "sensor" in raw.columns else [])
-    raw = raw.sort_values(order).drop_duplicates(["time", "variable"], keep="first")
-    wide = raw.pivot(index="time", columns="variable", values="value")
+    wide = _merge_gauges(raw, ["time", "variable"]).unstack("variable")
     wide = wide.rename(columns=VAR_MAP)
     for name, source in DERIVED.items():
         if source in wide.columns:
