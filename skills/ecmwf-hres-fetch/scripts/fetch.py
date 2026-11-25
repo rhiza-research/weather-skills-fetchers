@@ -13,7 +13,7 @@
 #   "eccodeslib",
 # ]
 # ///
-"""Fetch a deterministic ECMWF HRES forecast from ECMWF Open Data as a weather-skills Zarr."""
+"""Fetch a deterministic ECMWF HRES forecast for one init date or a range of inits from ECMWF Open Data as a weather-skills Zarr."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from weather_skills_core.units import (
 )
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
-_SKILL_VERSION = "0.0.14"
+_SKILL_VERSION = "0.0.15"
 
 # HRES steps
 _FULL_RUN_STEPS = list(range(0, 144 + 1, 3)) + list(range(150, 360 + 1, 6))
@@ -310,7 +310,7 @@ def _standardize(ds):
             ends = np.append(leads[1:], leads[-1] + gaps[-1])
             ds = ds.assign_coords(step_bounds=(("step", "nv"), np.stack([leads, ends], axis=1)))
             ds["step"].attrs["bounds"] = "step_bounds"
-    return stamp_data_interval(ds)
+    return stamp_data_interval(ds, dim="step")
 
 
 @weather_skill(
@@ -318,7 +318,15 @@ def _standardize(ds):
     version=_SKILL_VERSION,
 )
 @weather_skill.argument("--bbox")
-@weather_skill.argument("--date", required=True)
+@weather_skill.argument("--date")
+@weather_skill.argument(
+    "--start-time",
+    action="append",
+    help="Init window start; repeat with --end-time for several windows (each January).",
+)
+@weather_skill.argument(
+    "--end-time", action="append", help="Init window end, paired with --start-time."
+)
 @weather_skill.argument(
     "--run",
     type=int,
@@ -358,8 +366,8 @@ def _standardize(ds):
         "analysis time only. Default: every published step (15 days for 00/12)."
     ),
 )
-def fetch(bbox, date, run, variable, probe_latest, max_lead, **kwargs):
-    """Fetch a deterministic ECMWF HRES forecast from ECMWF Open Data as a weather-skills Zarr."""
+def fetch(bbox, date, start_time, end_time, run, variable, probe_latest, max_lead, **kwargs):
+    """Fetch a deterministic ECMWF HRES forecast for one init date or a range of inits from ECMWF Open Data as a weather-skills Zarr."""
     if probe_latest is not None:
         from ecmwf.opendata import Client
 
@@ -383,7 +391,26 @@ def fetch(bbox, date, run, variable, probe_latest, max_lead, **kwargs):
             "--bbox is required (HRES is retrieved as global GRIB2 and subset locally)."
         )
 
-    date_iso = date.isoformat()
+    # One (start, end) pair per window; --end-time is an inclusive calendar day.
+    windows = list(zip(start_time or [], end_time or [], strict=True))
+    if date is not None and windows:
+        raise UsageError(
+            "pass --date for one init, or --start-time/--end-time for a range of inits (not both)."
+        )
+    if windows:
+        # The --run init of each day in the windows, as with --date: the windows
+        # select init times, not valid times.
+        inits = sorted(
+            {a + dt.timedelta(days=n) for a, b in windows for n in range((b - a).days + 1)}
+        )
+        print(f"Selected {len(inits)} inits.", file=sys.stderr)
+    elif date is not None:
+        inits = [date]
+    else:
+        raise UsageError(
+            "pass --date for one init, or --start-time/--end-time for a range of inits."
+        )
+
     names = _resolve_variables(variable)
     max_lead_h = None if max_lead is None else _parse_max_lead(max_lead)
     steps = _steps_for(run, max_lead_h)
@@ -396,66 +423,93 @@ def fetch(bbox, date, run, variable, probe_latest, max_lead, **kwargs):
     import xarray as xr
     from ecmwf.opendata import Client
 
-    print(
-        f"Fetching ECMWF HRES for bbox={list(bbox)} date={date_iso} run={run:02d}Z "
-        f"variables={','.join(names)} steps={steps[0]}..{steps[-1]}h ({len(steps)})",
-        file=sys.stderr,
-    )
+    # One init at a time: each is downloaded, cut to the bbox and loaded, and its
+    # GRIB files are deleted before the next init.
+    oldest_on_ecmwf = dt.datetime.now(dt.UTC).date() - dt.timedelta(days=_ECMWF_DAYS_KEPT - 1)
+    pieces = []
+    for init in inits:
+        date_iso = init.isoformat()
+        print(
+            f"Fetching ECMWF HRES for bbox={list(bbox)} date={date_iso} run={run:02d}Z "
+            f"variables={','.join(names)} steps={steps[0]}..{steps[-1]}h ({len(steps)})",
+            file=sys.stderr,
+        )
+        try:
+            with tempfile.TemporaryDirectory(prefix="ecmwf-hres-fetch-") as tmpdir:
+                tmp = Path(tmpdir)
+                parts = []
+                for i, ((level_type, levels), group_vars) in enumerate(groups):
+                    req = _build_request(date_iso, run, group_vars, level_type, levels, steps)
+                    grib = tmp / f"hres_{i}.grib2"
+                    print(f"Retrieving {', '.join(group_vars)} ({level_type})...", file=sys.stderr)
+                    # Recent inits try ECMWF first (fastest), then AWS; older inits go
+                    # straight to AWS since data.ecmwf.int keeps only the last 4 days. Each
+                    # source gets one attempt: under load both answer "503 Slow Down", and
+                    # waiting it out leaves the user waiting for nothing.
+                    sources = ("ecmwf", "aws") if init >= oldest_on_ecmwf else ("aws",)
+                    errors = []
+                    for source in sources:
+                        try:
+                            client = Client(source=source, maximum_retries=1)
+                            client.retrieve(request=req, target=str(grib))
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(f"{source}: {exc}")
+                    else:
+                        if any("503" in e or "SlowDown" in e for e in errors):
+                            hint = (
+                                "The server is rate-limiting requests (503 Slow Down): fetch "
+                                "one init at a time and try again in a few minutes."
+                            )
+                        else:
+                            hint = (
+                                "The init may not be published yet (recent inits lag ~6-9h; "
+                                "try --probe-latest) or this is a transport problem."
+                            )
+                        raise DataError(
+                            f"ECMWF Open Data retrieval failed for init {date_iso} {run:02d}Z "
+                            f"({'; '.join(errors)}). {hint}"
+                        )
+                    ds = _promote_vertical(_open_grib(grib))
+                    parts.append(_rename_to_short(ds, group_vars))
 
-    with tempfile.TemporaryDirectory(prefix="ecmwf-hres-fetch-") as tmpdir:
-        tmp = Path(tmpdir)
-        parts = []
-        for i, ((level_type, levels), group_vars) in enumerate(groups):
-            req = _build_request(date_iso, run, group_vars, level_type, levels, steps)
-            grib = tmp / f"hres_{i}.grib2"
-            print(f"Retrieving {', '.join(group_vars)} ({level_type})...", file=sys.stderr)
-            # Recent inits try ECMWF first (fastest), then AWS; older inits go
-            # straight to AWS since data.ecmwf.int keeps only the last 4 days. Each source gets
-            # one attempt: under load both answer "503 Slow Down", and waiting
-            # it out leaves the user waiting for nothing.
-            oldest_on_ecmwf = dt.datetime.now(dt.UTC).date() - dt.timedelta(
-                days=_ECMWF_DAYS_KEPT - 1
-            )
-            sources = ("ecmwf", "aws") if date >= oldest_on_ecmwf else ("aws",)
-            errors = []
-            for source in sources:
-                try:
-                    client = Client(source=source, maximum_retries=1)
-                    client.retrieve(request=req, target=str(grib))
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{source}: {exc}")
-            else:
-                if any("503" in e or "SlowDown" in e for e in errors):
-                    hint = (
-                        "The server is rate-limiting requests (503 Slow Down): fetch one "
-                        "init at a time and try again in a few minutes."
-                    )
-                else:
-                    hint = (
-                        "The init may not be published yet (recent inits lag ~6-9h; try "
-                        "--probe-latest) or this is a transport problem."
-                    )
-                raise DataError(
-                    f"ECMWF Open Data retrieval failed for init {date_iso} {run:02d}Z "
-                    f"({'; '.join(errors)}). {hint}"
+                ds = (
+                    parts[0]
+                    if len(parts) == 1
+                    else xr.merge(parts, join="outer", compat="override")
                 )
-            ds = _promote_vertical(_open_grib(grib))
-            parts.append(_rename_to_short(ds, group_vars))
+                ds = ds[names]
+                ds = bbox_subset(ds, list(bbox), lat_dim="latitude", lon_dim="longitude")
+                if "step" not in ds.dims:
+                    # cfgrib keeps a lone step (--max-lead 0) as a scalar coordinate.
+                    ds = ds.expand_dims("step")
+                # Read one step at a time: cfgrib materializes the full global field for
+                # every step/level it is asked for before slicing to the bbox, so one
+                # whole-cube read of a pressure-level field needs several GB.
+                ds = xr.concat(
+                    [ds.isel(step=[i]).load() for i in range(ds.sizes["step"])], dim="step"
+                )
+                pieces.append(ds.load())
+        except DataError as exc:
+            if not windows:
+                raise
+            print(f"WARNING: HRES init {date_iso} {run:02d}Z skipped ({exc})", file=sys.stderr)
 
-        ds = parts[0] if len(parts) == 1 else xr.merge(parts, join="outer", compat="override")
-        ds = ds[names]
-        ds = bbox_subset(ds, list(bbox), lat_dim="latitude", lon_dim="longitude")
-        if "step" not in ds.dims:
-            # cfgrib keeps a lone step (--max-lead 0) as a scalar coordinate.
-            ds = ds.expand_dims("step")
-        # Read one step at a time: cfgrib materializes the full global field for
-        # every step/level it is asked for before slicing to the bbox, so one
-        # whole-cube read of a pressure-level field needs several GB.
-        ds = xr.concat([ds.isel(step=[i]).load() for i in range(ds.sizes["step"])], dim="step")
-        ds.attrs.update(Conventions="CF-1.13", weather_skills_source="ecmwf-hres")
-        ds = _standardize(ds)
-        ds = ds.load()
+    if not pieces:
+        window_text = ", ".join(f"{a}..{b}" for a, b in windows)
+        raise DataError(
+            f"no {run:02d} UTC HRES init in {window_text} could be retrieved. ECMWF Open Data "
+            "holds the last ~4 days and the AWS mirror inits from 2023; recent inits lag "
+            "~6-9h (try --probe-latest)."
+        )
+    if windows:
+        # A range of inits: a `time` axis (the init).
+        ds = xr.concat(pieces, "time", join="outer").transpose("time", "step", ...)
+    else:
+        ds = pieces[0]
+    ds.attrs.update(Conventions="CF-1.13", weather_skills_source="ecmwf-hres")
+    ds = _standardize(ds)
+    ds = ds.load()
 
     return ds
 
