@@ -26,7 +26,7 @@ from weather_skills_core.units import (
 )
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
-_SKILL_VERSION = "0.0.6"
+_SKILL_VERSION = "0.0.7"
 
 _ACCOUNT = "italynorthdata"
 _CONTAINER = "data"
@@ -429,6 +429,12 @@ def fetch(
             step=np.array(hours, dtype="timedelta64[h]") - np.timedelta64(24, "h")
         )
         da = da.drop_vars([c for c in da.coords if c not in da.dims])
+        # The files store the 0.1° grid as float32 (1.0 reads 1.00000024); round to
+        # float64 grid values so bbox edges select their row or column.
+        da = da.assign_coords(
+            latitude=da["latitude"].astype("float64").round(4),
+            longitude=da["longitude"].astype("float64").round(4),
+        )
         if bbox is not None:
             da = bbox_subset(da, bbox)
         fields.append(da)

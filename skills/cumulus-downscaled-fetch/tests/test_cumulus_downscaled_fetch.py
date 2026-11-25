@@ -189,6 +189,20 @@ def test_bbox_subsets(tmp_path, fetch_mod, remote):
         assert ds.sizes["latitude"] == 2 and ds.sizes["longitude"] == 1
 
 
+def test_bbox_edges_keep_float32_grid_rows(tmp_path, fetch_mod, remote, monkeypatch):
+    """Float32 coords just off the 0.1° grid are rounded, so a bbox edge on a row keeps it."""
+    read = xr.open_dataset
+    off_grid = np.array([1.0000002, 0.9, 0.8], "float32")
+    monkeypatch.setattr(
+        xr, "open_dataset", lambda buf, engine: read(buf, engine).assign_coords(latitude=off_grid)
+    )
+    out = tmp_path / "edge.zarr"
+    run_skill(fetch_mod.fetch, "--bbox", "1/36/0.9/36.1", "-o", str(out))
+    with xr.open_zarr(out, consolidated=True) as ds:
+        assert ds["latitude"].values == pytest.approx([0.9, 1.0])
+        assert ds["longitude"].values == pytest.approx([36.0, 36.1])
+
+
 def test_source_reads_another_subfolder(tmp_path, fetch_mod, remote, capsys):
     # Another source names its models differently and has only the imerg target.
     root = ROOT.replace("/aurora/", "/aurora-imerg/")
