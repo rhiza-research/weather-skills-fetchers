@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires Python 3.12 and uv. Installs the TAHMO Python SDK from GitHub (git+https://github.com/rhiza-research/tahmo-api). Station mode needs TAHMO_API_USERNAME and TAHMO_API_PASSWORD; --gold-stations and --gridded need read access to gs://sheerwater-datalake/hindcasts via GCLOUD_SERVICE_CREDENTIALS (service-account JSON contents) or GOOGLE_APPLICATION_CREDENTIALS (path to that JSON).
 allowed-tools: Bash(uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py *)
 metadata:
-  version: "0.1.3"
+  version: "0.1.4"
   catalog-group: fetchers
   variables: "precip temperature tmax tmin humidity pressure"
   required-env: "TAHMO_API_USERNAME TAHMO_API_PASSWORD"
@@ -54,7 +54,7 @@ uv run ${CLAUDE_SKILL_DIR}/scripts/fetch.py --probe-latest --gridded
 ### Station mode
 Both modes start from the same 5-minute records:
 - Only records with TAHMO quality flag <= 2 are used; others count as missing. Nothing is filled.
-- A station with several sensors of one standard variable gets, per record, the mean of the readings with the best quality flag. Among those, a rain gauge reading under 0.01 mm while another reads more is taken as blocked and left out. Several sensors of any other code (such as soil sensors at several depths) exit 1.
+- A station with several sensors of one standard variable gets, per record, the mean of its sensors' readings. First, a rain gauge whose day total is under 0.01 mm while another rain gauge's day total is 0.01 mm or more is taken as blocked and left out for that whole day (days as `--day-start-hour` sets them; UTC days for 5-minute records); then only the remaining readings with the best quality flag at each record count. Several sensors of any other code (such as soil sensors at several depths) exit 1.
 - `precip` is a rate in `mm day-1` (each 5-minute amount × 288).
 - TAHMO stamps the end of each interval; the output labels each interval or day by its start.
 
@@ -66,7 +66,9 @@ Output: dims `(time, station_id)`, coords `latitude`, `longitude`, `name`, `coun
 
 Daily values (`--daily`):
 - `time` is every requested day; `data_interval` `1 day`. Day D holds the records stamped D H:05 to D+1 H:00.
-- A day is NaN unless all 288 records are present, for each variable separately (`tmax`/`tmin` follow `temperature`). stderr prints each station's complete days; report how many stations were complete, and never total over a missing day.
+- A day is NaN unless all 288 records on the 5-minute grid are present, for each variable separately (`tmax`/`tmin` follow `temperature`). Never total over a missing day.
+
+stderr prints each station's complete steps, names each requested station with no data, warns about a `-v` variable no station has, and ends with `VAR: N of M requested stations complete` per variable. Report how many of the requested stations were complete.
 
 Errors: no `TAHMO_API_USERNAME` / `TAHMO_API_PASSWORD` exits 2. A failing station is dropped with a stderr line; no data at all exits 1.
 

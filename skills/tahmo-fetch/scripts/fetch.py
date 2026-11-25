@@ -37,7 +37,7 @@ from weather_skills_core.standard_utils import bbox_subset, is_transient, requir
 from weather_skills_core.units import stamp_data_interval
 
 # Auto-populated by the version-bump CI workflow. Do not edit manually.
-_SKILL_VERSION = "0.1.3"
+_SKILL_VERSION = "0.1.4"
 
 DEFAULT_WORKERS = 8
 _TAHMO_PREFIX = "TA"
@@ -69,7 +69,7 @@ EXTREMES = {
 # as the precip sum: a gap removes part of the diurnal cycle (e.g. the warm
 # afternoon), so a partial-day mean is a biased estimate, not an observation.
 SAMPLES_PER_DAY = 288
-# A 5-minute rain amount (mm) below this counts as dry when looking for a blocked gauge.
+# A gauge's day rain total (mm) below this counts as dry when looking for a blocked gauge.
 DRY_MM = 0.01
 # (standard_name, units). Always CF/pint strings — TAHMO getVariables() uses
 # "-" for dimensionless (relative humidity) and that fails pint.quantify().
@@ -165,7 +165,7 @@ def _fetch_gold(start_time, end_time, bbox, station_ids):
     ds = _open_gold()
 
     if station_ids:
-        wanted = [s.strip().upper() for s in station_ids]
+        wanted = list(dict.fromkeys(s.strip().upper() for s in station_ids))
         missing = sorted(set(wanted) - set(ds["station_id"].values))
         if missing:
             raise UsageError("no gold TAHMO record for station id(s): " + ", ".join(missing))
@@ -357,7 +357,7 @@ def _print_station_list(stations) -> None:
 def _select_stations(stations, station_ids, bbox):
     """Return deployment rows for explicit ``--station`` IDs, else TA stations in ``--bbox``."""
     if station_ids:
-        wanted = [s.strip().upper() for s in station_ids]
+        wanted = list(dict.fromkeys(s.strip().upper() for s in station_ids))
         by_code = stations.set_index(stations["code"].astype(str).str.upper())
         missing = [s for s in wanted if s not in by_code.index]
         if missing:
@@ -401,16 +401,25 @@ def _fetch_raw(api, station_id: str, start: str, end: str, variables=None):
         )
 
 
-def _merge_gauges(raw, keys):
+def _merge_gauges(raw, keys, offset):
     """Return one value per ``keys`` from redundant sensors: the mean of their QC'd readings.
 
-    Only readings with the best QC flag at that stamp count. Among those, a rain
-    gauge reading under DRY_MM while another reads rain is taken as blocked and left out.
+    A rain gauge whose day total is under DRY_MM while another rain gauge's day
+    total is DRY_MM or more is taken as blocked and left out for that whole day.
+    Days start ``offset`` after 00:00 UTC. Of the remaining readings, only those
+    with the best QC flag at each stamp count.
     """
+    import pandas as pd
+
+    # Stamps mark interval ends, so the HH:00 stamp closes the previous day.
+    raw = raw.assign(day=(raw["time"] - pd.Timedelta(minutes=5) - offset).dt.floor("D"))
+    raw = raw.reset_index(drop=True)
+    gauge_total = raw.groupby(["day", "variable", "sensor"])["value"].transform("sum")
+    wettest = gauge_total.groupby([raw["day"], raw["variable"]]).transform("max")
+    blocked = (raw["variable"] == "pr") & (gauge_total < DRY_MM) & (wettest >= DRY_MM)
+    raw = raw[~blocked]
     raw = raw[raw["quality"] == raw.groupby(keys)["quality"].transform("min")]
-    wet = raw.groupby(keys)["value"].transform("max") >= DRY_MM
-    blocked = (raw["variable"] == "pr") & wet & (raw["value"] < DRY_MM)
-    return raw[~blocked].groupby(keys)["value"].mean()
+    return raw.groupby(keys)["value"].mean()
 
 
 def _station_raw_frame(api, station_id: str, start: str, end: str, codes):
@@ -445,7 +454,7 @@ def _station_raw_frame(api, station_id: str, start: str, end: str, codes):
                 f"({', '.join(sorted(raw['sensor'].unique()))}); --variable takes "
                 "codes with one sensor per station."
             )
-        values = _merge_gauges(raw, "time")
+        values = _merge_gauges(raw, "time", pd.Timedelta(0))
         # A 5-minute rain amount (mm) as a rate, so precip is mm day-1 in both modes.
         if code == "pr":
             values = values * SAMPLES_PER_DAY
@@ -485,12 +494,11 @@ def _station_frame(api, station_id: str, start: str, end: str, day_start_hour: i
     raw["time"] = pd.to_datetime(raw["time"], format="mixed", utc=True).dt.tz_convert(None)
     keep_vars = set(VAR_MAP.keys())
     raw = raw[raw["variable"].isin(keep_vars) & (raw["time"] > first) & (raw["time"] <= last)]
-    if "quality" in raw.columns:
-        raw = raw[raw["quality"] <= 2]
+    raw = raw[raw["quality"] <= 2]
     if raw.empty:
         return None
 
-    wide = _merge_gauges(raw, ["time", "variable"]).unstack("variable")
+    wide = _merge_gauges(raw, ["time", "variable"], offset).unstack("variable")
     wide = wide.rename(columns=VAR_MAP)
     for name, source in DERIVED.items():
         if source in wide.columns:
@@ -503,11 +511,13 @@ def _station_frame(api, station_id: str, start: str, end: str, day_start_hour: i
     # the day it closes, and shift by the day-start hour so each day bins as
     # one calendar day labelled by the date it starts on.
     wide.index = wide.index - pd.Timedelta(minutes=5) - offset
-    days = wide[list(agg_spec)].resample("D")
-    daily = days.agg(agg_spec)
+    daily = wide[list(agg_spec)].resample("D").agg(agg_spec)
     # Plain sum gives 0 mm for an empty day and an undercount for a partial
-    # one; a mean over a partial day is biased. Keep only complete days.
-    daily = daily.where(days.count() >= SAMPLES_PER_DAY)
+    # one; a mean over a partial day is biased. Keep only complete days,
+    # counting records on the 5-minute grid only.
+    on_grid = wide.index == wide.index.floor("5min")
+    counts = wide.loc[on_grid, list(agg_spec)].resample("D").count()
+    daily = daily.where(counts >= SAMPLES_PER_DAY)
     daily = daily.reindex(pd.date_range(start, end, freq="D", name="time"))
     daily["station_id"] = station_id
     return daily
@@ -829,6 +839,7 @@ def fetch(
                 print(f"{sid}: DROPPED, worker error ({exc})", file=sys.stderr)
                 continue
             if result is None:
+                print(f"{sid}: no data in the requested range", file=sys.stderr)
                 continue
             frame, meta_row = result
             frames.append(frame)
@@ -896,13 +907,17 @@ def fetch(
         Conventions="CF-1.13",
         weather_skills_source="tahmo",
     )
+    for name in names:
+        if name not in ds.data_vars:
+            print(f"WARNING: no requested station has {name!r} data.", file=sys.stderr)
     # A station is complete when it reported every requested step; multi-day
     # totals are only meaningful for those (missing steps are never filled).
+    # Requested stations with no data count as incomplete.
     n_steps = ((end_time - start_time).days + 1) * (1 if daily else SAMPLES_PER_DAY)
     for name in sorted(ds.data_vars):
         complete = int((ds[name].notnull().sum("time") == n_steps).sum())
         print(
-            f"{name}: {complete} of {ds.sizes['station_id']} stations complete "
+            f"{name}: {complete} of {len(selected)} requested stations complete "
             f"(all {n_steps} {step} {start} → {end})",
             file=sys.stderr,
         )
