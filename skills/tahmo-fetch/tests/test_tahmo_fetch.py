@@ -57,6 +57,7 @@ def test_missing_tahmo_credentials_exits_2(tmp_path, fetch):
         with pytest.raises(SystemExit) as exc:
             run_skill(
                 fetch,
+                "--daily",
                 "--start-time",
                 "2026-01-01",
                 "--end-time",
@@ -80,6 +81,7 @@ def test_fetch_requires_station_or_bbox(tmp_path, fetch):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -152,6 +154,7 @@ def test_unknown_station_exits_2(tmp_path, mod, fetch):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -199,6 +202,7 @@ def test_fetch_writes_point_obs_zarr(tmp_path, mod, fetch):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -247,6 +251,7 @@ def test_fetch_by_bbox_skips_stations_outside(tmp_path, mod, fetch):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -286,6 +291,7 @@ def test_station_ids_take_precedence_over_bbox(tmp_path, mod, fetch):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -310,6 +316,7 @@ def _five_minute_raw(variable, day, value, drop=0):
             "variable": variable,
             "value": value,
             "quality": 1,
+            "sensor": "S1",
         }
     )
 
@@ -346,7 +353,13 @@ def test_midnight_stamp_closes_previous_utc_day(mod):
     day = _five_minute_raw("pr", "2026-01-01", 0.0)
     day.loc[day.index[-1], "value"] = 5.0  # 2026-01-02T00:00Z
     before = pd.DataFrame(  # closes 2025-12-31, outside the window
-        {"time": ["2026-01-01T00:00:00Z"], "variable": "pr", "value": 9.0, "quality": 1}
+        {
+            "time": ["2026-01-01T00:00:00Z"],
+            "variable": "pr",
+            "value": 9.0,
+            "quality": 1,
+            "sensor": "S1",
+        }
     )
     raw = pd.concat([before, day])
     with patch.object(mod, "_fetch_raw", return_value=raw) as fetch_raw:
@@ -355,6 +368,223 @@ def test_midnight_stamp_closes_previous_utc_day(mod):
     assert fetch_raw.call_args.args[2:] == ("2026-01-01", "2026-01-02")
     assert list(daily.index) == [pd.Timestamp("2026-01-01")]
     assert daily.loc["2026-01-01", "precip"] == pytest.approx(5.0)
+
+
+def test_raw_frame_keeps_five_minute_records(mod):
+    """One call per code; records labelled at interval start; gaps and failed QC are NaN."""
+    lv = _five_minute_raw("lv", "2026-01-01", 8100.0, drop=1).assign(sensor="logger")
+    lv.loc[lv.index[0], "quality"] = 3  # 00:05 stamp fails QC
+    ra = _five_minute_raw("ra", "2026-01-01", 250.0).assign(sensor="S1")
+    with patch.object(mod, "_fetch_raw", side_effect=[lv, ra]) as fetch_raw:
+        frame = mod._station_raw_frame(
+            MagicMock(), "TA00001", "2026-01-01", "2026-01-01", ["lv", "ra"]
+        )
+
+    assert [c.args[4] for c in fetch_raw.call_args_list] == [["lv"], ["ra"]]
+    assert list(frame.index) == list(
+        pd.date_range("2026-01-01", periods=288, freq="5min", name="time")
+    )
+    assert pd.isna(frame.loc["2026-01-01 00:00", "lv"])  # failed QC
+    assert frame.loc["2026-01-01 00:05", "lv"] == 8100.0
+    assert pd.isna(frame.loc["2026-01-01 23:55", "lv"])  # missing record
+    assert frame["ra"].notna().all()
+
+
+def test_raw_frame_names_precip_and_gives_a_rate(mod):
+    """pr comes out as precip in mm day-1: a 5-minute amount times 288."""
+    pr = _five_minute_raw("pr", "2026-01-01", 0.1).assign(sensor="S1")
+    with patch.object(mod, "_fetch_raw", return_value=pr):
+        frame = mod._station_raw_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01", ["pr"])
+    assert list(frame.columns) == ["precip", "station_id"]
+    assert frame["precip"].iloc[0] == pytest.approx(28.8)
+
+
+def test_redundant_rain_gauges_skip_a_blocked_gauge_and_average_the_rest(mod):
+    """A gauge dry all day beside a wet one is left out for that day; the rest are averaged."""
+    s1 = pd.concat(
+        [_five_minute_raw("pr", "2026-01-01", 0.0), _five_minute_raw("pr", "2026-01-02", 0.0)],
+        ignore_index=True,
+    )
+    s2 = s1.assign(sensor="S2")
+    # 2026-01-01: the gauges tip at different stamps; neither is blocked.
+    s1.loc[0, "value"] = 0.1
+    s2.loc[1, "value"] = 0.1
+    s2.loc[2, "value"] = 0.2
+    s1.loc[3, "value"], s2.loc[3, "value"], s2.loc[3, "quality"] = 0.2, 0.6, 2  # S1's flag wins
+    # 2026-01-02: S1 totals 0 while S2 reads rain, so S1 is blocked despite its better flag.
+    s2.loc[288, "value"], s2.loc[288, "quality"] = 0.3, 2
+    raw = pd.concat([s1, s2])
+    with patch.object(mod, "_fetch_raw", return_value=raw):
+        frame = mod._station_raw_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-02", ["pr"])
+    with patch.object(mod, "_fetch_raw", return_value=raw):
+        daily = mod._station_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-02")
+    assert frame["precip"].iloc[:4].tolist() == pytest.approx([14.4, 14.4, 28.8, 57.6])
+    assert frame["precip"].iloc[288] == pytest.approx(86.4)
+    # Gauge totals are 0.3 and 0.9 on 2026-01-01, 0.0 and 0.3 on 2026-01-02.
+    assert daily["precip"].tolist() == pytest.approx([0.4, 0.3])
+
+
+def test_off_grid_stamp_does_not_complete_a_day(mod):
+    """287 records on the 5-minute grid plus one off it is not a complete day."""
+    raw = _five_minute_raw("pr", "2026-01-01", 0.1, drop=1)
+    off_grid = raw.iloc[:1].assign(time="2026-01-01T12:03:00Z")
+    with patch.object(mod, "_fetch_raw", return_value=pd.concat([raw, off_grid])):
+        daily = mod._station_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01")
+    assert pd.isna(daily.loc["2026-01-01", "precip"])
+
+
+def test_repeated_station_id_is_fetched_once(tmp_path, mod, fetch):
+    daily = pd.DataFrame(
+        {"precip": [1.5], "station_id": "TA00001"},
+        index=pd.DatetimeIndex(["2026-01-01"], name="time"),
+    )
+    with (
+        patch.dict(os.environ, {"TAHMO_API_USERNAME": "user", "TAHMO_API_PASSWORD": "pass"}),
+        patch.object(mod, "_ensure_setup", side_effect=_fake_setup(MagicMock(), _stations())),
+        patch.object(mod, "_station_frame", return_value=daily) as station_frame,
+    ):
+        run_skill(
+            fetch,
+            "--daily",
+            "--start-time", "2026-01-01",
+            "--end-time", "2026-01-01",
+            "--station", "TA00001",
+            "--station", "ta00001",
+            "-o", str(tmp_path / "out.zarr"),
+        )  # fmt: skip
+    assert station_frame.call_count == 1
+    assert list(xr.open_zarr(tmp_path / "out.zarr")["station_id"].values) == ["TA00001"]
+
+
+def test_station_without_data_is_named_and_counted(tmp_path, mod, fetch, capsys):
+    """A requested station with no data is reported and counts as incomplete."""
+    daily = pd.DataFrame(
+        {"precip": [1.5], "station_id": "TA00001"},
+        index=pd.DatetimeIndex(["2026-01-01"], name="time"),
+    )
+    with (
+        patch.dict(os.environ, {"TAHMO_API_USERNAME": "user", "TAHMO_API_PASSWORD": "pass"}),
+        patch.object(mod, "_ensure_setup", side_effect=_fake_setup(MagicMock(), _stations())),
+        patch.object(
+            mod,
+            "_station_frame",
+            side_effect=lambda api, sid, *a: daily if sid == "TA00001" else None,
+        ),
+    ):
+        run_skill(
+            fetch,
+            "--daily", "-v", "precip", "-v", "humidity",
+            "--start-time", "2026-01-01",
+            "--end-time", "2026-01-01",
+            "--station", "TA00001",
+            "--station", "TA00002",
+            "-o", str(tmp_path / "out.zarr"),
+        )  # fmt: skip
+    err = capsys.readouterr().err
+    assert "TA00002: no data in the requested range" in err
+    assert "WARNING: no requested station has 'humidity' data." in err
+    assert "precip: 1 of 2 requested stations complete (all 1 days" in err
+
+
+def test_redundant_temperature_sensors_are_averaged_zeros_included(mod):
+    t1 = _five_minute_raw("te", "2026-01-01", 0.0).assign(sensor="S1")
+    t2 = _five_minute_raw("te", "2026-01-01", 2.0).assign(sensor="S2")
+    with patch.object(mod, "_fetch_raw", return_value=pd.concat([t1, t2])):
+        daily = mod._station_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01")
+    assert daily.loc["2026-01-01", "temperature"] == pytest.approx(1.0)
+
+
+def test_daily_variable_keeps_only_the_named_variables(tmp_path, mod, fetch):
+    out = tmp_path / "out.zarr"
+    daily = pd.DataFrame(
+        {"precip": [1.5], "temperature": [20.0], "station_id": "TA00001"},
+        index=pd.DatetimeIndex(["2026-01-01"], name="time"),
+    )
+    with (
+        patch.dict(os.environ, {"TAHMO_API_USERNAME": "user", "TAHMO_API_PASSWORD": "pass"}),
+        patch.object(mod, "_ensure_setup", side_effect=_fake_setup(MagicMock(), _stations())),
+        patch.object(mod, "_station_frame", return_value=daily),
+    ):
+        run_skill(
+            fetch,
+            "--start-time", "2026-01-01",
+            "--end-time", "2026-01-01",
+            "--station", "TA00001",
+            "--daily", "-v", "precip",
+            "-o", str(out),
+        )  # fmt: skip
+    ds = xr.open_zarr(out)
+    assert list(ds.data_vars) == ["precip"]
+    assert ds["precip"].attrs["data_interval"] == "1 day"
+
+
+def test_raw_frame_rejects_simultaneous_sensors(mod):
+    st = pd.concat(
+        [
+            _five_minute_raw("st", "2026-01-01", 20.0).assign(sensor="S1"),
+            _five_minute_raw("st", "2026-01-01", 21.0).assign(sensor="S2"),
+        ]
+    )
+    with patch.object(mod, "_fetch_raw", return_value=st), pytest.raises(mod.DataError):
+        mod._station_raw_frame(MagicMock(), "TA00001", "2026-01-01", "2026-01-01", ["st"])
+
+
+def test_variable_writes_five_minute_zarr(tmp_path, mod, fetch):
+    out = tmp_path / "out.zarr"
+    frame = pd.DataFrame(
+        {"lb": [100.0, 99.0], "lv": [8100.0, 8099.0], "station_id": "TA00001"},
+        index=pd.DatetimeIndex(["2026-01-01 00:00", "2026-01-01 00:05"], name="time"),
+    )
+    var_meta = {"lb": {"units": "-", "description": "Logger battery percentage"}}
+    with (
+        patch.dict(os.environ, {"TAHMO_API_USERNAME": "user", "TAHMO_API_PASSWORD": "pass"}),
+        patch.object(
+            mod, "_ensure_setup", side_effect=_fake_setup(MagicMock(), _stations(), var_meta)
+        ),
+        patch.object(mod, "_station_raw_frame", return_value=frame),
+    ):
+        run_skill(
+            fetch,
+            "--start-time", "2026-01-01",
+            "--end-time", "2026-01-01",
+            "--station", "TA00001",
+            "--variable", "lb",
+            "--variable", "lv",
+            "-o", str(out),
+        )  # fmt: skip
+
+    ds = xr.open_zarr(out)
+    assert ds["lb"].attrs["units"] == "percent"
+    assert ds["lv"].attrs["units"] == "mV"
+    assert ds["lv"].attrs["long_name"] == "Logger battery voltage"
+    assert ds["lb"].attrs["data_interval"] == "5 minute"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--variable", "zz"],
+        ["--variable", "lb", "--day-start-hour", "6"],
+        ["--variable", "tmax"],
+        ["--daily", "--variable", "lb"],
+        [],
+    ],
+)
+def test_variable_usage_errors_exit_2(tmp_path, mod, fetch, extra):
+    with (
+        patch.dict(os.environ, {"TAHMO_API_USERNAME": "user", "TAHMO_API_PASSWORD": "pass"}),
+        patch.object(mod, "_ensure_setup", side_effect=_fake_setup(MagicMock(), _stations())),
+        pytest.raises(SystemExit) as exc,
+    ):
+        run_skill(
+            fetch,
+            "--start-time", "2026-01-01",
+            "--end-time", "2026-01-01",
+            "--station", "TA00001",
+            *extra,
+            "-o", str(tmp_path / "out.zarr"),
+        )  # fmt: skip
+    assert exc.value.code == 2
 
 
 def test_fetch_reports_complete_stations(tmp_path, mod, fetch, capsys):
@@ -373,6 +603,7 @@ def test_fetch_reports_complete_stations(tmp_path, mod, fetch, capsys):
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -382,7 +613,7 @@ def test_fetch_reports_complete_stations(tmp_path, mod, fetch, capsys):
             "-o",
             str(tmp_path / "out.zarr"),
         )
-    assert "precip: 0 of 1 stations complete (all 3 days" in capsys.readouterr().err
+    assert "precip: 0 of 1 requested stations complete (all 3 days" in capsys.readouterr().err
 
 
 def _temperature_day(day, drop=0):
@@ -429,6 +660,7 @@ def test_fetch_writes_tmax_tmin_and_counts_complete_stations(tmp_path, mod, fetc
     ):
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-01-01",
             "--end-time",
@@ -442,8 +674,8 @@ def test_fetch_writes_tmax_tmin_and_counts_complete_stations(tmp_path, mod, fetc
         )
 
     err = capsys.readouterr().err
-    assert "tmax: 1 of 2 stations complete (all 2 days" in err
-    assert "tmin: 1 of 2 stations complete (all 2 days" in err
+    assert "tmax: 1 of 2 requested stations complete (all 2 days" in err
+    assert "tmin: 1 of 2 requested stations complete (all 2 days" in err
     ds = xr.open_zarr(out, consolidated=True)
     for name, method in [("tmax", "time: maximum"), ("tmin", "time: minimum")]:
         assert ds[name].attrs["units"] == "degree_Celsius"
@@ -465,10 +697,17 @@ def test_day_start_hour_shifts_the_daily_window(mod):
             "variable": "pr",
             "value": 0.1,
             "quality": 1,
+            "sensor": "S1",
         }
     )
     before = pd.DataFrame(  # 06:00 2 Oct closes 1 Oct, outside the window
-        {"time": ["2026-10-02T06:00:00Z"], "variable": "pr", "value": 9.0, "quality": 1}
+        {
+            "time": ["2026-10-02T06:00:00Z"],
+            "variable": "pr",
+            "value": 9.0,
+            "quality": 1,
+            "sensor": "S1",
+        }
     )
     raw = pd.concat([before, day])
     with patch.object(mod, "_fetch_raw", return_value=raw) as fetch_raw:
@@ -487,6 +726,7 @@ def test_day_start_hour_out_of_range_exits_2(tmp_path, fetch):
     with pytest.raises(SystemExit) as exc:
         run_skill(
             fetch,
+            "--daily",
             "--start-time",
             "2026-10-02",
             "--end-time",
